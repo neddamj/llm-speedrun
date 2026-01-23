@@ -6,9 +6,10 @@ from itertools import cycle
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, IterableDataset, DataLoader
 
 from tqdm import tqdm
+from dataclasses import dataclass
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
@@ -119,7 +120,7 @@ class GPT(nn.Module):
         return logits, loss
 
 # ------------------------- 
-# Data: WikiText-2 + GPT-2 BPE
+# Data: FineWeb + GPT-2 BPE
 # ------------------------- 
 class TokenBlockDataset(Dataset):
     """
@@ -145,21 +146,105 @@ class TokenBlockDataset(Dataset):
         y = chunk[1:]
         return x, y
 
-def build_wikitext2_tokens(tokenizer, split: str, max_examples: int | None = None):
-    ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split=split)
-    texts = ds["text"]
-    if max_examples is not None:
-        texts = texts[:max_examples]
+class FineWebIterableDataset(IterableDataset):
+    """
+    Stream FineWeb and emit token blocks without storing the corpus in memory.
+    """
+    def __init__(
+        self,
+        tokenizer,
+        block_size: int,
+        split: str,
+        subset: str,
+        text_field: str,
+        shuffle_buffer: int,
+        seed: int,
+        dataset_name: str = "HuggingFaceFW/fineweb",
+        max_tokens: int | None = None,
+    ):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.block_size = block_size
+        self.split = split
+        self.subset = subset
+        self.text_field = text_field
+        self.shuffle_buffer = shuffle_buffer
+        self.seed = seed
+        self.dataset_name = dataset_name
+        self.max_tokens = max_tokens
+
+    def __iter__(self):
+        ds = load_dataset(
+            self.dataset_name,
+            self.subset,
+            split=self.split,
+            streaming=True,
+        )
+        if self.shuffle_buffer and self.shuffle_buffer > 0:
+            ds = ds.shuffle(seed=self.seed, buffer_size=self.shuffle_buffer)
+
+        token_buffer: list[int] = []
+        emitted_tokens = 0
+        eos = self.tokenizer.eos_token_id
+
+        for row in ds:
+            text = row.get(self.text_field)
+            if not text:
+                continue
+            ids = self.tokenizer.encode(text, add_special_tokens=False)
+            if not ids:
+                continue
+
+            token_buffer.extend(ids)
+            token_buffer.append(eos)
+
+            while len(token_buffer) > self.block_size:
+                x = token_buffer[:self.block_size]
+                y = token_buffer[1 : self.block_size + 1]
+                emitted_tokens += self.block_size
+                yield torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
+                del token_buffer[: self.block_size]
+
+                if self.max_tokens is not None and emitted_tokens >= self.max_tokens:
+                    return
+
+
+def build_fineweb_val_tokens(
+    tokenizer,
+    subset: str,
+    text_field: str,
+    max_tokens: int,
+    dataset_name: str = "HuggingFaceFW/fineweb",
+    split: str = "train",
+):
+    """
+    Stream a slice of FineWeb and materialize enough tokens for validation.
+    """
+    ds = load_dataset(
+        dataset_name,
+        subset,
+        split=split,
+        streaming=True,
+    )
+    tokens: list[int] = []
     eos = tokenizer.eos_token_id
-    all_ids = []
-    for t in texts:
-        t = t.strip()
-        if not t:
+
+    for row in ds:
+        text = row.get(text_field)
+        if not text:
             continue
-        ids = tokenizer.encode(t, add_special_tokens=False)
-        all_ids.extend(ids)
-        all_ids.append(eos)  # separate documents
-    return torch.tensor(all_ids, dtype=torch.long)
+        ids = self_tokenize(tokenizer, text)
+        tokens.extend(ids)
+        tokens.append(eos)
+        if len(tokens) >= max_tokens:
+            break
+
+    return torch.tensor(tokens[:max_tokens], dtype=torch.long)
+
+
+def self_tokenize(tokenizer, text: str):
+    """Helper to allow build_fineweb_val_tokens to stay TorchScript friendly if needed."""
+    return tokenizer.encode(text, add_special_tokens=False)
 
 # ------------------------- 
 # Validation function
@@ -200,36 +285,64 @@ def main(experiment_name: str = "baseline"):
     @dataclass
     class TrainingConfig:
         batch_size: int = 8
-        steps: int = 1000
+        steps: int = 5000
         lr: float = 3e-4
         eval_interval: int = 100
         eval_batches: int = 50
 
+    @dataclass
+    class DataConfig:
+        fineweb_subset: str = "sample-10BT"
+        fineweb_text_field: str = "text"
+        fineweb_split: str = "train"
+        val_max_tokens: int = 500_000  # ~2k blocks at block_size=256
+        shuffle_buffer: int = 10_000
+        seed: int = 1337
+        dataset_name: str = "HuggingFaceFW/fineweb"
+
     model_cfg = GPTConfig()
     train_cfg = TrainingConfig()
-    
-    max_train_examples = None
-    max_val_examples = None
+    data_cfg = DataConfig()
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Setup logging with experiment name in filename
-    log_file_path = f"logs/training_log_{experiment_name}.csv"
+    log_file_path = f"../logs/training_log_{experiment_name}.csv"
     log_file = open(log_file_path, 'w', newline='')
     csv_writer = csv.writer(log_file)
     # Write header
-    csv_writer.writerow(['step', 'train_loss', 'val_loss'])
+    csv_writer.writerow(['step', 'train_loss', 'val_loss', 'tokens_seen', 'toks_per_s_avg', 'toks_per_s_win'])
 
     tokenizer = AutoTokenizer.from_pretrained("gpt2", use_fast=True)
     # Update vocab_size to match tokenizer
     model_cfg.vocab_size = tokenizer.vocab_size  # 50257 for GPT-2
 
-    train_tokens = build_wikitext2_tokens(tokenizer, split="train", max_examples=max_train_examples)
-    val_tokens = build_wikitext2_tokens(tokenizer, split="validation", max_examples=max_val_examples)
-
-    train_dataset = TokenBlockDataset(train_tokens, block_size=model_cfg.block_size)
+    train_dataset = FineWebIterableDataset(
+        tokenizer=tokenizer,
+        block_size=model_cfg.block_size,
+        split=data_cfg.fineweb_split,
+        subset=data_cfg.fineweb_subset,
+        text_field=data_cfg.fineweb_text_field,
+        shuffle_buffer=data_cfg.shuffle_buffer,
+        seed=data_cfg.seed,
+        dataset_name=data_cfg.dataset_name,
+    )
+    val_tokens = build_fineweb_val_tokens(
+        tokenizer=tokenizer,
+        subset=data_cfg.fineweb_subset,
+        text_field=data_cfg.fineweb_text_field,
+        max_tokens=data_cfg.val_max_tokens,
+        dataset_name=data_cfg.dataset_name,
+        split=data_cfg.fineweb_split,
+    )
     val_dataset = TokenBlockDataset(val_tokens, block_size=model_cfg.block_size)
 
-    train_loader = DataLoader(train_dataset, batch_size=train_cfg.batch_size, shuffle=True)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=train_cfg.batch_size,
+        shuffle=False,  # streaming shuffle handled inside dataset
+        num_workers=0,
+    )
     val_loader = DataLoader(val_dataset, batch_size=train_cfg.batch_size, shuffle=False)
 
     model = GPT(model_cfg).to(device)
@@ -238,6 +351,9 @@ def main(experiment_name: str = "baseline"):
     model.train()
     train_iter = cycle(train_loader)
     train_start = time.perf_counter()
+    tokens_seen = 0
+    last_log_time = train_start
+    last_log_tokens = 0
 
     pbar = tqdm(range(train_cfg.steps), desc="Training")
     for step in pbar:
@@ -251,14 +367,32 @@ def main(experiment_name: str = "baseline"):
         loss.backward()
         optimizer.step()
 
+        tokens_this_batch = x.numel()
+        tokens_seen += tokens_this_batch
+
+        now_time = time.perf_counter()
+        interval_elapsed = now_time - last_log_time
+        interval_tokens = tokens_seen - last_log_tokens
+        throughput_window = interval_tokens / interval_elapsed if interval_elapsed > 0 else 0.0
+        throughput_avg = tokens_seen / (now_time - train_start + 1e-9)
+        last_log_time = now_time
+        last_log_tokens = tokens_seen
+
         current_train_loss = loss.item()
-        pbar.set_postfix({'train_loss': f'{current_train_loss:.4f}'})
+        pbar.set_postfix({'train_loss': f'{current_train_loss:.4f}', 'toks/s': f'{throughput_window:.0f}'})
 
         if step % train_cfg.eval_interval == 0 and step > 0:
             val_loss = evaluate(model, val_loader, device, max_batches=train_cfg.eval_batches)
             pbar.set_postfix({'train_loss': f'{current_train_loss:.4f}', 'val_loss': f'{val_loss:.4f}'})
             # Log to CSV
-            csv_writer.writerow([step, f'{current_train_loss:.6f}', f'{val_loss:.6f}'])
+            csv_writer.writerow([
+                step,
+                f'{current_train_loss:.6f}',
+                f'{val_loss:.6f}',
+                tokens_seen,
+                f'{throughput_avg:.2f}',
+                f'{throughput_window:.2f}',
+            ])
             log_file.flush()
 
     train_end = time.perf_counter()
@@ -267,13 +401,27 @@ def main(experiment_name: str = "baseline"):
     # Final validation loss
     final_val_loss = evaluate(model, val_loader, device, max_batches=train_cfg.eval_batches)
 
+    end_time = time.perf_counter()
+    final_throughput_avg = tokens_seen / (end_time - train_start + 1e-9)
+    final_interval_elapsed = end_time - last_log_time
+    final_interval_tokens = tokens_seen - last_log_tokens
+    final_throughput_window = final_interval_tokens / final_interval_elapsed if final_interval_elapsed > 0 else 0.0
+
     # Log final results
-    csv_writer.writerow([train_cfg.steps, 'N/A', f'{final_val_loss:.6f}'])
+    csv_writer.writerow([
+        train_cfg.steps,
+        'N/A',
+        f'{final_val_loss:.6f}',
+        tokens_seen,
+        f'{final_throughput_avg:.2f}',
+        f'{final_throughput_window:.2f}',
+    ])
     log_file.flush()
     log_file.close()
 
-    return final_val_loss, train_time
+    return final_val_loss, train_time, final_throughput_avg
 
 if __name__ == "__main__":
-    val_loss, train_time = main("baseline")
-    print(f"Returned validation loss: {val_loss:.4f}, training time: {train_time:.2f}s")
+    experiment_name = "baseline"
+    val_loss, train_time, avg_throughput = main(experiment_name)
+    print(f"Returned validation loss: {val_loss:.4f}, training time: {train_time:.2f}s, average throughput: {avg_throughput:.2f} tokens/sec")
