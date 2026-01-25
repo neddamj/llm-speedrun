@@ -55,6 +55,7 @@ def plot_all_training_runs():
     plt.tight_layout()
     
     # Save the plot
+    os.makedirs('../figs', exist_ok=True)
     output_file = '../figs/training_comparison.png'
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
     print(f"\nPlot saved to: {output_file}")
