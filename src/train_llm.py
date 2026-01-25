@@ -284,7 +284,7 @@ def main(experiment_name: str = "baseline"):
     @dataclass
     class GPTConfig:
         block_size: int = 256
-        vocab_size: int = 50257  # larger vocab size, multiple of 128
+        vocab_size: int = 50304  # larger vocab size, multiple of 128
         n_layer: int = 12
         n_head: int = 12
         n_embd: int = 768
@@ -326,7 +326,7 @@ def main(experiment_name: str = "baseline"):
 
     tokenizer = AutoTokenizer.from_pretrained("gpt2", use_fast=True)
     # Update vocab_size to match tokenizer
-    model_cfg.vocab_size = tokenizer.vocab_size  # 50257 for GPT-2
+    #model_cfg.vocab_size = tokenizer.vocab_size  # 50257 for GPT-2
 
     train_dataset = FineWebIterableDataset(
         tokenizer=tokenizer,
@@ -433,6 +433,6 @@ def main(experiment_name: str = "baseline"):
     return final_val_loss, train_time, final_throughput_avg
 
 if __name__ == "__main__":
-    experiment_name = "baseline"
+    experiment_name = "larger-vocab-size"
     val_loss, train_time, avg_throughput = main(experiment_name)
     print(f"Returned validation loss: {val_loss:.4f}, training time: {train_time:.2f}s, average throughput: {avg_throughput:.2f} tokens/sec")
