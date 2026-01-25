@@ -1,6 +1,8 @@
 import csv
 import time
 import math
+import random
+import numpy as np
 from itertools import cycle
 
 import torch
@@ -13,6 +15,13 @@ from dataclasses import dataclass
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    
 # ------------------------- 
 # Model
 # ------------------------- 
@@ -208,7 +217,6 @@ class FineWebIterableDataset(IterableDataset):
                 if self.max_tokens is not None and emitted_tokens >= self.max_tokens:
                     return
 
-
 def build_fineweb_val_tokens(
     tokenizer,
     subset: str,
@@ -276,7 +284,7 @@ def main(experiment_name: str = "baseline"):
     @dataclass
     class GPTConfig:
         block_size: int = 256
-        vocab_size: int = 50257
+        vocab_size: int = 50257  # larger vocab size, multiple of 128
         n_layer: int = 12
         n_head: int = 12
         n_embd: int = 768
@@ -285,7 +293,7 @@ def main(experiment_name: str = "baseline"):
     @dataclass
     class TrainingConfig:
         batch_size: int = 8
-        steps: int = 5000
+        steps: int = 10000
         lr: float = 3e-4
         eval_interval: int = 100
         eval_batches: int = 50
@@ -303,6 +311,9 @@ def main(experiment_name: str = "baseline"):
     model_cfg = GPTConfig()
     train_cfg = TrainingConfig()
     data_cfg = DataConfig()
+
+    # Set random seed for reproducibility
+    set_seed(data_cfg.seed)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
