@@ -10,6 +10,7 @@ from contextlib import nullcontext
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.nn.attention import sdpa_kernel, SDPBackend
 from torch.utils.data import Dataset, IterableDataset, DataLoader
 
 from tqdm import tqdm
@@ -43,6 +44,7 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        self.attn_impl = getattr(config, "attn_impl", "manual")
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # minimal: manual attention + causal mask
@@ -59,10 +61,19 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, head_dim).transpose(1, 2)
         q = q.view(B, T, self.n_head, head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, head_dim).transpose(1, 2)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(head_dim))
-        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        y = att @ v
+        use_flash = self.attn_impl == "flash" and x.is_cuda
+        if use_flash:
+            # Let PyTorch pick flash/mem-efficient kernels; causal handled by kernel
+            backends = (SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH)
+            with sdpa_kernel(backends=backends):
+                y = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True
+                )
+        else:
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(head_dim))
+            att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
+            att = F.softmax(att, dim=-1)
+            y = att @ v
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
         return y
@@ -291,6 +302,7 @@ def main(experiment_name: str = "baseline"):
         n_head: int = 12
         n_embd: int = 768
         bias: bool = True
+        attn_impl: str = "flash"  # manual | flash
 
     @dataclass
     class TrainingConfig:
@@ -468,6 +480,6 @@ def main(experiment_name: str = "baseline"):
     return final_val_loss, train_time, final_throughput_avg
 
 if __name__ == "__main__":
-    experiment_name = "torch.compile "
+    experiment_name = "flash_attention"
     val_loss, train_time, avg_throughput = main(experiment_name)
     print(f"Returned validation loss: {val_loss:.4f}, training time: {train_time:.2f}s, average throughput: {avg_throughput:.2f} tokens/sec")
