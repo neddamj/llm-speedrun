@@ -378,6 +378,7 @@ def main(experiment_name: str = "baseline"):
     )
 
     model = GPT(model_cfg).to(device)
+    model = torch.compile(model) if hasattr(torch, 'compile') else model
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_cfg.lr)
 
     model.train()
@@ -467,6 +468,6 @@ def main(experiment_name: str = "baseline"):
     return final_val_loss, train_time, final_throughput_avg
 
 if __name__ == "__main__":
-    experiment_name = "mixed_precision_bf16"
+    experiment_name = "torch.compile "
     val_loss, train_time, avg_throughput = main(experiment_name)
     print(f"Returned validation loss: {val_loss:.4f}, training time: {train_time:.2f}s, average throughput: {avg_throughput:.2f} tokens/sec")
