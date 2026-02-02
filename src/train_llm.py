@@ -296,7 +296,7 @@ def evaluate(model, val_loader, device, max_batches=None):
 def main(experiment_name: str = "baseline"):
     @dataclass
     class GPTConfig:
-        block_size: int = 256
+        block_size: int = 1024
         vocab_size: int = 50304  # larger vocab size, multiple of 128
         n_layer: int = 12
         n_head: int = 12
@@ -480,6 +480,6 @@ def main(experiment_name: str = "baseline"):
     return final_val_loss, train_time, final_throughput_avg
 
 if __name__ == "__main__":
-    experiment_name = "flash_attention"
+    experiment_name = "1024_block_size"
     val_loss, train_time, avg_throughput = main(experiment_name)
     print(f"Returned validation loss: {val_loss:.4f}, training time: {train_time:.2f}s, average throughput: {avg_throughput:.2f} tokens/sec")
