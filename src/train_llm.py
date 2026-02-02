@@ -1,3 +1,4 @@
+import os
 import csv
 import time
 import math
@@ -357,6 +358,7 @@ def main(experiment_name: str = "baseline"):
     val_loader = DataLoader(val_dataset, batch_size=train_cfg.batch_size, shuffle=False)
 
     model = GPT(model_cfg).to(device)
+    model = torch.compile(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_cfg.lr)
 
     model.train()
@@ -396,6 +398,7 @@ def main(experiment_name: str = "baseline"):
             val_loss = evaluate(model, val_loader, device, max_batches=train_cfg.eval_batches)
             pbar.set_postfix({'train_loss': f'{current_train_loss:.4f}', 'val_loss': f'{val_loss:.4f}'})
             # Log to CSV
+            os.makedirs("../logs", exist_ok=True)
             csv_writer.writerow([
                 step,
                 f'{current_train_loss:.6f}',
@@ -433,6 +436,6 @@ def main(experiment_name: str = "baseline"):
     return final_val_loss, train_time, final_throughput_avg
 
 if __name__ == "__main__":
-    experiment_name = "larger-vocab-size"
+    experiment_name = "torch.compile"
     val_loss, train_time, avg_throughput = main(experiment_name)
     print(f"Returned validation loss: {val_loss:.4f}, training time: {train_time:.2f}s, average throughput: {avg_throughput:.2f} tokens/sec")
