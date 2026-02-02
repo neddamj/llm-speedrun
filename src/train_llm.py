@@ -5,6 +5,7 @@ import math
 import random
 import numpy as np
 from itertools import cycle
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -267,8 +268,8 @@ def evaluate(model, val_loader, device, max_batches=None):
     for i, (x, y) in enumerate(val_loader):
         if max_batches is not None and i >= max_batches:
             break
-        x = x.to(device)
-        y = y.to(device)
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
         _, loss = model(x, y)
         total_loss += loss.item()
         num_batches += 1
@@ -298,6 +299,7 @@ def main(experiment_name: str = "baseline"):
         lr: float = 3e-4
         eval_interval: int = 100
         eval_batches: int = 50
+        precision: str = "bf16"  # choices: fp32 | fp16 | bf16
 
     @dataclass
     class DataConfig:
@@ -317,8 +319,20 @@ def main(experiment_name: str = "baseline"):
     set_seed(data_cfg.seed)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    device_type = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # precision setup
+    if device_type == "cuda" and train_cfg.precision == "fp16":
+        autocast_dtype = torch.float16
+    elif train_cfg.precision == "bf16":
+        autocast_dtype = torch.bfloat16
+    else:
+        autocast_dtype = None
+
+    scaler = torch.amp.GradScaler(enabled=(device_type == "cuda" and train_cfg.precision == "fp16"))
 
     # Setup logging with experiment name in filename
+    os.makedirs("../logs", exist_ok=True)
     log_file_path = f"../logs/training_log_{experiment_name}.csv"
     log_file = open(log_file_path, 'w', newline='')
     csv_writer = csv.writer(log_file)
@@ -354,11 +368,16 @@ def main(experiment_name: str = "baseline"):
         batch_size=train_cfg.batch_size,
         shuffle=False,  # streaming shuffle handled inside dataset
         num_workers=0,
+        pin_memory=(device_type == "cuda"),
     )
-    val_loader = DataLoader(val_dataset, batch_size=train_cfg.batch_size, shuffle=False)
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=train_cfg.batch_size,
+        shuffle=False,
+        pin_memory=(device_type == "cuda"),
+    )
 
     model = GPT(model_cfg).to(device)
-    model = torch.compile(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_cfg.lr)
 
     model.train()
@@ -371,14 +390,22 @@ def main(experiment_name: str = "baseline"):
     pbar = tqdm(range(train_cfg.steps), desc="Training")
     for step in pbar:
         x, y = next(train_iter)
-        x = x.to(device)
-        y = y.to(device)
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
 
-        _, loss = model(x, y)
+        autocast_ctx = torch.autocast(device_type=device_type, dtype=autocast_dtype) if autocast_dtype else nullcontext()
+        with autocast_ctx:
+            _, loss = model(x, y)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
         tokens_this_batch = x.numel()
         tokens_seen += tokens_this_batch
@@ -395,7 +422,9 @@ def main(experiment_name: str = "baseline"):
         pbar.set_postfix({'train_loss': f'{current_train_loss:.4f}', 'toks/s': f'{throughput_window:.0f}'})
 
         if step % train_cfg.eval_interval == 0 and step > 0:
-            val_loss = evaluate(model, val_loader, device, max_batches=train_cfg.eval_batches)
+            eval_ctx = torch.autocast(device_type=device_type, dtype=autocast_dtype) if autocast_dtype else nullcontext()
+            with eval_ctx:
+                val_loss = evaluate(model, val_loader, device, max_batches=train_cfg.eval_batches)
             pbar.set_postfix({'train_loss': f'{current_train_loss:.4f}', 'val_loss': f'{val_loss:.4f}'})
             # Log to CSV
             os.makedirs("../logs", exist_ok=True)
@@ -413,7 +442,9 @@ def main(experiment_name: str = "baseline"):
     train_time = train_end - train_start
 
     # Final validation loss
-    final_val_loss = evaluate(model, val_loader, device, max_batches=train_cfg.eval_batches)
+    eval_ctx = torch.autocast(device_type=device_type, dtype=autocast_dtype) if autocast_dtype else nullcontext()
+    with eval_ctx:
+        final_val_loss = evaluate(model, val_loader, device, max_batches=train_cfg.eval_batches)
 
     end_time = time.perf_counter()
     final_throughput_avg = tokens_seen / (end_time - train_start + 1e-9)
@@ -436,6 +467,6 @@ def main(experiment_name: str = "baseline"):
     return final_val_loss, train_time, final_throughput_avg
 
 if __name__ == "__main__":
-    experiment_name = "torch.compile"
+    experiment_name = "mixed_precision_bf16"
     val_loss, train_time, avg_throughput = main(experiment_name)
     print(f"Returned validation loss: {val_loss:.4f}, training time: {train_time:.2f}s, average throughput: {avg_throughput:.2f} tokens/sec")
