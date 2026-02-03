@@ -312,6 +312,8 @@ def main(experiment_name: str = "baseline"):
         eval_interval: int = 100
         eval_batches: int = 50
         precision: str = "bf16"  # choices: fp32 | fp16 | bf16
+        warmup_frac: float = 0.05
+        min_lr_ratio: float = 0.1
 
     @dataclass
     class DataConfig:
@@ -326,6 +328,18 @@ def main(experiment_name: str = "baseline"):
     model_cfg = GPTConfig()
     train_cfg = TrainingConfig()
     data_cfg = DataConfig()
+
+    warmup_steps = max(1, int(train_cfg.steps * train_cfg.warmup_frac))
+    min_lr = train_cfg.lr * train_cfg.min_lr_ratio
+
+    def get_lr(step: int) -> float:
+        if step < warmup_steps:
+            return train_cfg.lr * (step + 1) / warmup_steps
+        if train_cfg.steps <= warmup_steps:
+            return train_cfg.lr
+        progress = (step - warmup_steps) / (train_cfg.steps - warmup_steps)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr + (train_cfg.lr - min_lr) * cosine
 
     # Set random seed for reproducibility
     set_seed(data_cfg.seed)
@@ -349,7 +363,7 @@ def main(experiment_name: str = "baseline"):
     log_file = open(log_file_path, 'w', newline='')
     csv_writer = csv.writer(log_file)
     # Write header
-    csv_writer.writerow(['step', 'train_loss', 'val_loss', 'tokens_seen', 'toks_per_s_avg', 'toks_per_s_win'])
+    csv_writer.writerow(['step', 'train_loss', 'val_loss', 'tokens_seen', 'toks_per_s_avg', 'toks_per_s_win', 'lr'])
 
     tokenizer = AutoTokenizer.from_pretrained("gpt2", use_fast=True)
     # Update vocab_size to match tokenizer
@@ -402,6 +416,9 @@ def main(experiment_name: str = "baseline"):
 
     pbar = tqdm(range(train_cfg.steps), desc="Training")
     for step in pbar:
+        lr = get_lr(step)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
         x, y = next(train_iter)
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
@@ -432,13 +449,13 @@ def main(experiment_name: str = "baseline"):
         last_log_tokens = tokens_seen
 
         current_train_loss = loss.item()
-        pbar.set_postfix({'train_loss': f'{current_train_loss:.4f}', 'toks/s': f'{throughput_window:.0f}'})
+        pbar.set_postfix({'train_loss': f'{current_train_loss:.4f}', 'toks/s': f'{throughput_window:.0f}', 'lr': f'{lr:.2e}'})
 
         if step % train_cfg.eval_interval == 0 and step > 0:
             eval_ctx = torch.autocast(device_type=device_type, dtype=autocast_dtype) if autocast_dtype else nullcontext()
             with eval_ctx:
                 val_loss = evaluate(model, val_loader, device, max_batches=train_cfg.eval_batches)
-            pbar.set_postfix({'train_loss': f'{current_train_loss:.4f}', 'val_loss': f'{val_loss:.4f}'})
+            pbar.set_postfix({'train_loss': f'{current_train_loss:.4f}', 'val_loss': f'{val_loss:.4f}', 'lr': f'{lr:.2e}'})
             # Log to CSV
             os.makedirs("../logs", exist_ok=True)
             csv_writer.writerow([
@@ -448,6 +465,7 @@ def main(experiment_name: str = "baseline"):
                 tokens_seen,
                 f'{throughput_avg:.2f}',
                 f'{throughput_window:.2f}',
+                f'{lr:.8e}',
             ])
             log_file.flush()
 
@@ -464,6 +482,7 @@ def main(experiment_name: str = "baseline"):
     final_interval_elapsed = end_time - last_log_time
     final_interval_tokens = tokens_seen - last_log_tokens
     final_throughput_window = final_interval_tokens / final_interval_elapsed if final_interval_elapsed > 0 else 0.0
+    final_lr = get_lr(train_cfg.steps - 1) if train_cfg.steps > 0 else train_cfg.lr
 
     # Log final results
     csv_writer.writerow([
@@ -473,6 +492,7 @@ def main(experiment_name: str = "baseline"):
         tokens_seen,
         f'{final_throughput_avg:.2f}',
         f'{final_throughput_window:.2f}',
+        f'{final_lr:.8e}',
     ])
     log_file.flush()
     log_file.close()
@@ -480,6 +500,6 @@ def main(experiment_name: str = "baseline"):
     return final_val_loss, train_time, final_throughput_avg
 
 if __name__ == "__main__":
-    experiment_name = "1024_block_size"
+    experiment_name = "weight decay"
     val_loss, train_time, avg_throughput = main(experiment_name)
     print(f"Returned validation loss: {val_loss:.4f}, training time: {train_time:.2f}s, average throughput: {avg_throughput:.2f} tokens/sec")
