@@ -25,9 +25,53 @@ def set_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     
-# ------------------------- 
+# -------------------------
 # Model
-# ------------------------- 
+# -------------------------
+def rotate_half(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    q = (q * cos) + (rotate_half(q) * sin)
+    k = (k * cos) + (rotate_half(k) * sin)
+    return q, k
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim: int, max_position_embeddings: int, base: float = 10000.0):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.max_seq_len_cached = max_position_embeddings
+        self.cos_cached = None
+        self.sin_cached = None
+        self.cache_device = None
+        self.cache_dtype = None
+
+    def _update_cos_sin(self, seq_len: int, device, dtype):
+        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos().to(dtype=dtype)
+        sin = emb.sin().to(dtype=dtype)
+        self.cos_cached = cos[None, None, :, :]
+        self.sin_cached = sin[None, None, :, :]
+        self.max_seq_len_cached = seq_len
+        self.cache_device = device
+        self.cache_dtype = dtype
+
+    def forward(self, seq_len: int, device, dtype):
+        if (
+            self.cos_cached is None
+            or self.sin_cached is None
+            or seq_len > self.max_seq_len_cached
+            or self.cache_device != device
+            or self.cache_dtype != dtype
+        ):
+            self._update_cos_sin(seq_len, device, dtype)
+        return self.cos_cached[:, :, :seq_len, :], self.sin_cached[:, :, :seq_len, :]
+
 class LayerNorm(nn.Module):
     """LayerNorm with optional bias."""
     def __init__(self, ndim: int, bias: bool):
@@ -44,9 +88,12 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        head_dim = config.n_embd // config.n_head
+        assert head_dim % 2 == 0
         self.attn_impl = getattr(config, "attn_impl", "manual")
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.rope = RotaryEmbedding(head_dim, config.block_size, base=config.rope_theta)
         # minimal: manual attention + causal mask
         self.register_buffer(
             "mask",
@@ -61,6 +108,8 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, head_dim).transpose(1, 2)
         q = q.view(B, T, self.n_head, head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, head_dim).transpose(1, 2)
+        cos, sin = self.rope(T, device=x.device, dtype=q.dtype)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
         use_flash = self.attn_impl == "flash" and x.is_cuda
         if use_flash:
             # Let PyTorch pick flash/mem-efficient kernels; causal handled by kernel
@@ -105,7 +154,6 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
-        self.wpe = nn.Embedding(config.block_size, config.n_embd)
         self.h = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         self.ln_f = LayerNorm(config.n_embd, bias=config.bias)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -126,8 +174,7 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         B, T = idx.shape
         assert T <= self.config.block_size
-        pos = torch.arange(0, T, device=idx.device, dtype=torch.long)
-        x = self.wte(idx) + self.wpe(pos)
+        x = self.wte(idx)
         for block in self.h:
             x = block(x)
         x = self.ln_f(x)
@@ -302,6 +349,7 @@ def main(experiment_name: str = "baseline"):
         n_embd: int = 768
         bias: bool = True
         attn_impl: str = "flash"  # manual | flash
+        rope_theta: float = 10000.0
 
     @dataclass
     class TrainingConfig:
@@ -499,6 +547,6 @@ def main(experiment_name: str = "baseline"):
     return final_val_loss, train_time, final_throughput_avg
 
 if __name__ == "__main__":
-    experiment_name = "relu^2 activation"
+    experiment_name = "RoPE"
     val_loss, train_time, avg_throughput = main(experiment_name)
     print(f"Returned validation loss: {val_loss:.4f}, training time: {train_time:.2f}s, average throughput: {avg_throughput:.2f} tokens/sec")
