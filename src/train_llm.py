@@ -82,12 +82,11 @@ class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu = nn.GELU()
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
 
     def forward(self, x):
-        return self.c_proj(self.gelu(self.c_fc(x)))
-
+        return self.c_proj(F.relu(self.c_fc(x)) ** 2)
+    
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -500,6 +499,6 @@ def main(experiment_name: str = "baseline"):
     return final_val_loss, train_time, final_throughput_avg
 
 if __name__ == "__main__":
-    experiment_name = "weight decay"
+    experiment_name = "relu^2 activation"
     val_loss, train_time, avg_throughput = main(experiment_name)
     print(f"Returned validation loss: {val_loss:.4f}, training time: {train_time:.2f}s, average throughput: {avg_throughput:.2f} tokens/sec")
